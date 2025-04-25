@@ -117,92 +117,9 @@
 # the next step of llm generating response based on what user said, and hence i tried looking into what events vad offers and
 # that is when i came across VADStream class so i need to try that now to check if this overall code can identify the user
 # starting and stopping
-# import asyncio
-# import logging
-# import time
-# from dotenv import load_dotenv
-# from livekit import rtc
-# from livekit.agents import (
-#     AutoSubscribe,
-#     JobContext,
-#     WorkerOptions,
-#     cli,
-#     stt,
-#     transcription,
-# )
-# from livekit.plugins import openai, silero
-
-# load_dotenv()
-
-# logger = logging.getLogger("transcriber")
-
-
-# async def _forward_transcription(
-#     stt_stream: stt.SpeechStream, stt_forwarder: transcription.STTSegmentsForwarder
-# ):
-#     """Forward real-time transcription to the client and log in console"""
-#     async for ev in stt_stream:
-#         if ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
-#             print(
-#                 " [INTERIM] ->", ev.alternatives[0].text, end="\r", flush=True
-#             )  # Keep updating
-#         elif ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
-#             print("\n [FINAL] ->", ev.alternatives[0].text)
-#         elif ev.type == stt.SpeechEventType.RECOGNITION_USAGE:
-#             logger.debug(f"metrics: {ev.recognition_usage}")
-
-#         stt_forwarder.update(ev)
-
-
-# async def entrypoint(ctx: JobContext):
-#     logger.info(f"Starting real-time transcriber, room: {ctx.room.name}")
-
-#     stt_impl = openai.STT(language="ur")
-
-#     if not stt_impl.capabilities.streaming:
-#         # Enable near-real-time processing by reducing silence detection time
-#         stt_impl = stt.StreamAdapter(
-#             stt=stt_impl,
-#             vad=silero.VAD.load(min_silence_duration=0.3),  # Reduced silence duration
-#         )
-
-#     async def transcribe_track(participant: rtc.RemoteParticipant, track: rtc.Track):
-#         audio_stream = rtc.AudioStream(track)
-#         stt_forwarder = transcription.STTSegmentsForwarder(
-#             room=ctx.room, participant=participant, track=track
-#         )
-
-#         stt_stream = stt_impl.stream()
-#         asyncio.create_task(_forward_transcription(stt_stream, stt_forwarder))
-#         # vad_stream = silero.VADStream(vad=silero.VAD.load(min_silence_duration=0.3))
-#         async for ev in audio_stream:
-#             # if vad_stream.is_speech(ev.frame):
-#             stt_stream.push_frame(ev.frame)  # Push frames as they arrive
-
-#     @ctx.room.on("track_subscribed")
-#     def on_track_subscribed(
-#         track: rtc.Track,
-#         publication: rtc.TrackPublication,
-#         participant: rtc.RemoteParticipant,
-#     ):
-#         if track.kind == rtc.TrackKind.KIND_AUDIO:
-#             asyncio.create_task(transcribe_track(participant, track))
-
-#     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-
-
-# if __name__ == "__main__":
-#     cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint))
-
-
-# okay now we are here to check if the vadstream option which livekit provides is of acutally any help in identifying
-# wether the user is speaking or not, also the next step would be that if we can identify these correctly then in the
-# case of user not speaking we need to make a call to llm to answer the user's question which will basically  be the
-# transcript
 import asyncio
 import logging
 import time
-import openai
 from dotenv import load_dotenv
 from livekit import rtc
 from livekit.agents import (
@@ -211,26 +128,70 @@ from livekit.agents import (
     WorkerOptions,
     cli,
     stt,
+    llm,
     transcription,
 )
 from livekit.plugins import openai, silero
+from livekit.agents import transcription
+
+from context import CONTEXT
 
 load_dotenv()
 
 logger = logging.getLogger("transcriber")
 
 
+async def call_llm(transcript):
+    """Send the final transcript to an LLM for processing."""
+    try:
+        initial_ctx = llm.ChatContext().append(
+            role="system",
+            text=(
+                "Your name is Zainab baji, an expert in providing neonatal care. You are soft, caring but extremely professional when responding. your main language of interaction is urdu"
+                "you have knowlegde of the WHO guidelines when it comes to antenatal care."
+                "you need to ascertain if your directly speaking with the paitent or someone representing the patient and then address them in your answers appropriately."
+                "you need to enquire if more details are needed."
+                "Keep in mind that your user may need responses urgently so try to craft concise and to the point responses unless asked to elaborate."
+                "you are mainly interfacing with users through voice and your user base are generaly people in remote areas or places with a lack of adequate medical facilities"
+                "Your output is sent to a transcription service that will convert your responses to text. ALWAYS respond in urdu."
+                "politley reject any query outside of your scope stating your reason."
+                "try to speak in words that are generally spoken rather than written as most of your users may not be literate."
+                "Do not give your responses in any form of markdown. try to give youre response as a natural response."
+                "you have acces to a database that has a list of all users registered. the only thing you can do is check if someone exists in the db."
+                f"Here is the question {transcript} and all the context you need to get started: {CONTEXT}"
+            ),
+        )
+        llm_instance = openai.LLM(model="gpt-4o-mini")
+        response = llm_instance.chat(chat_ctx=initial_ctx, temperature=0)
+
+        reply = response["choices"][0]["message"]["content"]
+        print("\n[LLM RESPONSE]:", reply)
+        # return reply
+    except Exception as e:
+        print("\n[ERROR] Failed to call LLM:", str(e))
+        # return None
+
+
 async def _forward_transcription(
     stt_stream: stt.SpeechStream, stt_forwarder: transcription.STTSegmentsForwarder
 ):
     """Forward real-time transcription to the client and log in console"""
+    cumulative_transcript = ""
     async for ev in stt_stream:
-        if ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
-            print(
-                " [INTERIM] ->", ev.alternatives[0].text, end="\r", flush=True
-            )  # Keep updating
+        if ev.type == stt.SpeechEventType.START_OF_SPEECH:
+            print("\n[EVENT] User started speaking.")
+
+        elif ev.type == stt.SpeechEventType.END_OF_SPEECH:
+            print("\n[EVENT] User stopped speaking.")
+            # asyncio.create_task(call_llm(cumulative_transcript))
+
+        elif ev.type == stt.SpeechEventType.INTERIM_TRANSCRIPT:
+            print(" [INTERIM] ->", ev.alternatives[0].text, end="\r", flush=True)
+
         elif ev.type == stt.SpeechEventType.FINAL_TRANSCRIPT:
             print("\n [FINAL] ->", ev.alternatives[0].text)
+            cumulative_transcript += " " + ev.alternatives[0].text
+
         elif ev.type == stt.SpeechEventType.RECOGNITION_USAGE:
             logger.debug(f"metrics: {ev.recognition_usage}")
 
@@ -240,13 +201,14 @@ async def _forward_transcription(
 async def entrypoint(ctx: JobContext):
     logger.info(f"Starting real-time transcriber, room: {ctx.room.name}")
 
-    stt_impl = openai.STT(language="ur")
+    stt_impl = openai.STT.with_groq(
+        model="whisper-large-v3-turbo", language="ur", detect_language=False
+    )
 
     if not stt_impl.capabilities.streaming:
-        # Enable near-real-time processing by reducing silence detection time
         stt_impl = stt.StreamAdapter(
             stt=stt_impl,
-            vad=silero.VAD.load(min_silence_duration=0.3),  # Reduced silence duration
+            vad=silero.VAD.load(min_silence_duration=0.1),
         )
 
     async def transcribe_track(participant: rtc.RemoteParticipant, track: rtc.Track):
@@ -256,35 +218,10 @@ async def entrypoint(ctx: JobContext):
         )
 
         stt_stream = stt_impl.stream()
-        vad_stream = silero.VADStream(vad=silero.VAD.load(min_silence_duration=0.3))
-
         asyncio.create_task(_forward_transcription(stt_stream, stt_forwarder))
-
-        silence_threshold = 1.0  # User stops speaking after 1 second of silence
-        last_speech_time = time.time()
-        user_speaking = False  # Track if user is currently speaking
-
-        async def monitor_silence():
-            """Continuously check for silence and detect speech stop events."""
-            nonlocal last_speech_time, user_speaking
-            while True:
-                await asyncio.sleep(0.1)  # Check every 100ms
-                if (
-                    user_speaking
-                    and (time.time() - last_speech_time) > silence_threshold
-                ):
-                    print("\n[EVENT] User stopped speaking.")
-                    user_speaking = False  # Reset state
-
-        asyncio.create_task(monitor_silence())  # Start silence detection
-
         async for ev in audio_stream:
-            if vad_stream.is_speech(ev.frame):
-                last_speech_time = time.time()  # Reset silence timer
-                if not user_speaking:
-                    print("\n[EVENT] User started speaking.")
-                    user_speaking = True  # Set speaking state
-                stt_stream.push_frame(ev.frame)  # Send audio frame to STT
+            # print("[DEBUG] Pushing frame at", time.time())
+            stt_stream.push_frame(ev.frame)
 
     @ctx.room.on("track_subscribed")
     def on_track_subscribed(
